@@ -8,11 +8,11 @@ import numpy as np
 import pandas as pd
 from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import RandomForestRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder
+from sklearn.preprocessing import TargetEncoder
+from xgboost import XGBRegressor
 
 RANDOM_STATE = 42
 TARGET_COLUMN = "posted_rate"
@@ -30,6 +30,11 @@ NUMERIC_FEATURES = [
     "day_of_month",
     "month",
     "week_of_year",
+    "is_weekend",
+    "quarter",
+    "haversine_distance",
+    "lat_diff",
+    "lon_diff",
 ]
 
 CATEGORICAL_FEATURES = [
@@ -57,8 +62,16 @@ BASE_FEATURES = [
 def ensure_positive(values: np.ndarray) -> np.ndarray:
     return np.clip(values, 1.0, None)
 
+def haversine_vectorized(lat1, lon1, lat2, lon2):
+    lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = np.sin(dlat/2.0)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2.0)**2
+    c = 2 * np.arcsin(np.sqrt(a))
+    return 3959.87433 * c # Earth radius in miles
 
-def add_date_features(frame: pd.DataFrame) -> pd.DataFrame:
+
+def add_date_and_geo_features(frame: pd.DataFrame) -> pd.DataFrame:
     result = frame.copy()
 
     for column in BASE_FEATURES:
@@ -75,9 +88,17 @@ def add_date_features(frame: pd.DataFrame) -> pd.DataFrame:
     result["day_of_month"] = parsed_date.dt.day
     result["month"] = parsed_date.dt.month
     result["week_of_year"] = iso_week
+    result["is_weekend"] = (parsed_date.dt.dayofweek >= 5).astype(int)
+    result["quarter"] = parsed_date.dt.quarter
+    
+    result["haversine_distance"] = haversine_vectorized(
+        result["pickup_lat"], result["pickup_lon"],
+        result["delivery_lat"], result["delivery_lon"]
+    )
+    result["lat_diff"] = result["delivery_lat"] - result["pickup_lat"]
+    result["lon_diff"] = result["delivery_lon"] - result["pickup_lon"]
 
-    # Keep original raw features and append calendar signal columns.
-    return result[BASE_FEATURES + ["day_of_week", "day_of_month", "month", "week_of_year"]]
+    return result[BASE_FEATURES + ["day_of_week", "day_of_month", "month", "week_of_year", "is_weekend", "quarter", "haversine_distance", "lat_diff", "lon_diff"]]
 
 
 def build_pipeline() -> Pipeline:
@@ -90,7 +111,7 @@ def build_pipeline() -> Pipeline:
     categorical_pipeline = Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="most_frequent")),
-            ("onehot", OneHotEncoder(handle_unknown="ignore")),
+            ("target_encoder", TargetEncoder(smooth="auto")),
         ]
     )
 
@@ -102,9 +123,13 @@ def build_pipeline() -> Pipeline:
         remainder="drop",
     )
 
-    model = RandomForestRegressor(
-        n_estimators=450,
-        min_samples_leaf=2,
+    model = XGBRegressor(
+        n_estimators=1000,
+        learning_rate=0.05,
+        max_depth=7,
+        min_child_weight=2,
+        subsample=0.8,
+        colsample_bytree=0.8,
         n_jobs=-1,
         random_state=RANDOM_STATE,
     )
@@ -138,10 +163,10 @@ def temporal_train_validation_split(frame: pd.DataFrame, train_ratio: float = 0.
 
 
 def evaluate_model(pipeline: Pipeline, train_frame: pd.DataFrame, valid_frame: pd.DataFrame) -> dict[str, float]:
-    x_train = add_date_features(train_frame)
+    x_train = add_date_and_geo_features(train_frame)
     y_train = train_frame[TARGET_COLUMN].astype(float)
 
-    x_valid = add_date_features(valid_frame)
+    x_valid = add_date_and_geo_features(valid_frame)
     y_valid = valid_frame[TARGET_COLUMN].astype(float)
 
     pipeline.fit(x_train, y_train)
@@ -191,6 +216,15 @@ def write_validation_predictions(
     predicted.to_csv(output_path, index=False)
 
 
+def clean_training_data(frame: pd.DataFrame) -> pd.DataFrame:
+    cleaned = frame.copy()
+    cleaned = cleaned[cleaned[TARGET_COLUMN] > 0]
+    
+    p995 = cleaned[TARGET_COLUMN].quantile(0.995)
+    cleaned = cleaned[cleaned[TARGET_COLUMN] <= p995]
+    return cleaned
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train freight rate model and create submission files")
     parser.add_argument("--train", default="train-test.csv", help="Path to train/test CSV")
@@ -233,15 +267,17 @@ def main() -> None:
     if "load_id" not in validation_frame.columns:
         raise ValueError("Validation CSV must contain load_id column")
 
+    train_frame = clean_training_data(train_frame)
+
     train_split, valid_split = temporal_train_validation_split(train_frame, train_ratio=0.8)
 
     base_pipeline = build_pipeline()
     metrics = evaluate_model(base_pipeline, train_split, valid_split)
 
     final_pipeline = clone(base_pipeline)
-    final_pipeline.fit(add_date_features(train_frame), train_frame[TARGET_COLUMN].astype(float))
+    final_pipeline.fit(add_date_and_geo_features(train_frame), train_frame[TARGET_COLUMN].astype(float))
 
-    validation_predictions = ensure_positive(final_pipeline.predict(add_date_features(validation_frame)))
+    validation_predictions = ensure_positive(final_pipeline.predict(add_date_and_geo_features(validation_frame)))
     write_validation_predictions(
         validation_frame=validation_frame,
         predictions=validation_predictions,
@@ -249,7 +285,7 @@ def main() -> None:
         template_path=validation_template_path,
     )
 
-    december_predictions = ensure_positive(final_pipeline.predict(add_date_features(december_frame)))
+    december_predictions = ensure_positive(final_pipeline.predict(add_date_and_geo_features(december_frame)))
     december_output = december_frame.copy()
     december_output["predicted_rate"] = np.round(december_predictions, 2)
     december_output.to_csv(december_input_path, index=False)
